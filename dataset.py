@@ -3,6 +3,9 @@ from dotenv import load_dotenv
 import os
 from tqdm import tqdm
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import multiprocessing
 
 
 def build_card_name_to_index(card_data):
@@ -38,59 +41,100 @@ class ClashDataset:
         self.human_readable = human_readable
         self.card_to_idx = build_card_name_to_index(get_all_cards(self.api))
 
-    def get_battle_summary(self, player_tags, save=True):
+    def get_battle_summary(
+        self, player_tags, save=True, workers=20, flush_every=1_000, resume=True
+    ):
+
+        print("Workers:", workers)
+
         if isinstance(player_tags, str):
             player_tags = [player_tags]
 
         summary = {}
-        for idx, player_tag in enumerate(tqdm(player_tags, desc="Processing players")):
+        if resume and os.path.exists("battle_summary.json"):
             try:
-                battles = self.api.get_player_battles(player_tag)
-                for battle in battles:
-                    team_player = battle.team[0]
-                    opponent_player = battle.opponent[0]
-                    team_crowns = sum(member.crowns for member in battle.team)
-                    opponent_crowns = sum(member.crowns for member in battle.opponent)
+                with open("battle_summary.json", "r") as f:
+                    summary = json.load(f)
+            except Exception:
+                pass
 
-                    if opponent_crowns > team_crowns:
-                        continue
+        pending = [t for t in player_tags if t not in summary]
 
-                    result = {
+        card_to_idx = self.card_to_idx  # local ref
+        human = self.human_readable
+
+        def process(tag):
+            battles = self.api.get_player_battles(tag)
+            results = []
+            for battle in battles:
+                if len(battle.team) != 1 or len(battle.opponent) != 1:
+                    # tqdm.write(
+                    #     f"Skipping battle with missing team or opponent for player {tag}"
+                    # )
+                    continue
+
+                team_player = battle.team[0]
+                opponent_player = battle.opponent[0]
+
+                deck_team = [
+                    (c.name if human else card_to_idx[c.name])
+                    for c in team_player.cards
+                ]
+                deck_opp = [
+                    (c.name if human else card_to_idx[c.name])
+                    for c in opponent_player.cards
+                ]
+                results.append(
+                    {
                         "team_player": {
                             "tag": team_player.tag,
-                            "deck": [
-                                (
-                                    card.name
-                                    if self.human_readable
-                                    else self.card_to_idx[card.name]
-                                )
-                                for card in team_player.cards
-                            ],
+                            "deck": deck_team,
                             "crowns": team_player.crowns,
                         },
                         "opponent_player": {
                             "tag": opponent_player.tag,
-                            "deck": [
-                                (
-                                    card.name
-                                    if self.human_readable
-                                    else self.card_to_idx[card.name]
-                                )
-                                for card in team_player.cards
-                            ],
+                            "deck": deck_opp,
                             "crowns": opponent_player.crowns,
                         },
-                        "result": ("win" if team_crowns > opponent_crowns else "loss"),
+                        "result": (
+                            "win"
+                            if team_player.crowns > opponent_player.crowns
+                            else (
+                                "loss"
+                                if team_player.crowns < opponent_player.crowns
+                                else "draw"
+                            )
+                        ),
                     }
-                    if player_tag not in summary:
-                        summary[player_tag] = []
-                    summary[player_tag].append(result)
+                )
+            return tag, results
 
-                if idx % 100 == 0:
+        if not pending:
+            return summary
+
+        last_flush = time.time()
+        completed_since_flush = 0
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(process, tag): tag for tag in pending}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Players"):
+                tag, results = (), []
+                try:
+                    tag, results = fut.result()
+                except Exception as e:
+                    tqdm.write(f"Error processing {tag}: {e}")
+                    continue
+
+                summary[tag] = results
+                completed_since_flush += 1
+                if save and (
+                    completed_since_flush >= flush_every
+                    or time.time() - last_flush > 30
+                ):
                     with open("battle_summary.json", "w") as f:
                         json.dump(summary, f)
-            except Exception as e:
-                print(f"Error processing {player_tag}: {e}")
+                    last_flush = time.time()
+                    completed_since_flush = 0
 
         if save:
             with open("battle_summary.json", "w") as f:

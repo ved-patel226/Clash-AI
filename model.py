@@ -1,25 +1,23 @@
 """
-Model Architecture:
+Model Architecture (Updated):
 
-- Input: Deck of 8 cards, represented as indices (LongTensor of shape [batch_size, deck_size]).
-- Embedding Layer: Each card is mapped to a learnable embedding of size `embedding_dim` (captures card features).
-- Flatten: Concatenate embeddings of all 8 cards into a single vector of size `deck_size * embedding_dim`.
-- Fully Connected Layers:
-    - fc1: Hidden layer with `hidden_dim` neurons, ReLU activation.
-    - fc2: Hidden layer with `hidden_dim` neurons, ReLU activation.
-    - fc3: Output layer with `num_cards` neurons, sigmoid activation.
-- Output: Probability vector of length `num_cards` representing likelihood of each card being selected for a counter-deck.
-- Training: Use Binary Cross-Entropy Loss treating each card as independent.
-- Deck Generation: Sample top-k cards from output probabilities to form a counter-deck of 8 cards.
+- Input: Two decks of 8 cards each (your deck and opponent's deck)
+- Embedding Layer: Each card index is mapped to a learnable embedding of size `embedding_dim`.
+- Deck Encoder: For each deck, embeddings are flattened and passed through two fully connected layers with ReLU activations to produce a deck representation.
+- Concatenation: The encoded representations of both decks are concatenated.
+- Output Layer: A fully connected layer maps the concatenated vector to a 4x4 matrix (flattened to 16 outputs), representing the probabilities of each possible tower outcome.
+- Softmax: Softmax activation is applied across the 16 outputs to produce a probability distribution over the 4x4 outcome matrix.
+- Output: The output is reshaped to (batch_size, 4, 4), representing the predicted probability for each tower outcome.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from torch.optim import Adam
 
 
-class DeckCounterNet(pl.LightningModule):
+class ClashRoyaleOutcomeNet(pl.LightningModule):
     def __init__(
         self, num_cards=120, deck_size=8, embedding_dim=32, hidden_dim=256, lr=1e-3
     ):
@@ -30,57 +28,69 @@ class DeckCounterNet(pl.LightningModule):
 
         self.card_embedding = nn.Embedding(num_cards, embedding_dim)
 
-        self.fc1 = nn.Linear(deck_size * embedding_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, num_cards)
+        self.deck_encoder = nn.Sequential(
+            nn.Linear(deck_size * embedding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
 
-        print(f"FC1: {self.fc1}")
-        print(f"FC2: {self.fc2}")
-        print(f"FC3: {self.fc3}")
+        self.fc_out = nn.Linear(hidden_dim * 2, 16)
+        self.save_hyperparameters()
 
-    def forward(self, deck_indices):
+    def forward(self, deck1, deck2):
         """
-        deck_indices: LongTensor of shape (batch_size, deck_size)
+        deck1: LongTensor (batch_size, deck_size)  -> your deck
+        deck2: LongTensor (batch_size, deck_size)  -> opponent deck
         """
-        # Embed each card and flatten
-        x = self.card_embedding(deck_indices)  # (batch, deck_size, embedding_dim)
-        x = x.view(x.size(0), -1)  # (batch, deck_size * embedding_dim)
+        x1 = self.card_embedding(deck1)
+        x1 = x1.view(x1.size(0), -1)
+        x1 = self.deck_encoder(x1)
 
-        # Forward through MLP
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.sigmoid(self.fc3(x))  # probability for each card in counter-deck
+        x2 = self.card_embedding(deck2)
+        x2 = x2.view(x2.size(0), -1)
+        x2 = self.deck_encoder(x2)
 
+        x = torch.cat([x1, x2], dim=1)
+
+        x = self.fc_out(x)
+        x = F.softmax(x, dim=1)
+
+        x = x.view(-1, 4, 4)
         return x
 
+    def configure_optimizers(self):
+        return Adam(self.parameters(), lr=self.lr)
+
     def training_step(self, batch, batch_idx):
-        deck_indices, target_counter_deck = batch
-        output = self(deck_indices)
-        loss = F.binary_cross_entropy(output, target_counter_deck)
-        self.log("train_loss", loss)
+        deck1, deck2, targets = batch
+
+        predictions = self(deck1, deck2)
+        loss = F.cross_entropy(predictions.view(-1, 16), targets.view(-1, 16))
+        self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        deck_indices, target_counter_deck = batch
-        output = self(deck_indices)
-        loss = F.binary_cross_entropy(output, target_counter_deck)
-        self.log("val_loss", loss)
+        deck1, deck2, targets = batch
+        predictions = self(deck1, deck2)
+        loss = F.cross_entropy(predictions.view(-1, 16), targets.view(-1, 16))
+        self.log("val_loss", loss, prog_bar=True)
         return loss
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 
 def main() -> None:
-    model = DeckCounterNet()
+    num_cards = 120
+    deck_size = 8
+    model = ClashRoyaleOutcomeNet(num_cards=num_cards, deck_size=deck_size)
 
-    cr_deck = torch.tensor([[3, 17, 5, 0, 42, 88, 19, 11]])  # shape: (1, 8)
+    # Example of using the model directly for prediction
+    my_deck = torch.randint(0, num_cards, (1, deck_size))  # shape (1,8)
+    opp_deck = torch.randint(0, num_cards, (1, deck_size))  # shape (1,8)
 
-    output = model(cr_deck)
+    outcome_matrix = model(my_deck, opp_deck)
+    outcome_matrix = outcome_matrix * 100  # convert probabilities to percentages
 
-    # To get a counter-deck, pick the top 8 cards
-    top_indices = torch.topk(output, 8, dim=1).indices
-    print("Suggested counter-deck indices:", top_indices)
+    print("Predicted tower outcome probabilities:\n", outcome_matrix)
 
 
 if __name__ == "__main__":
